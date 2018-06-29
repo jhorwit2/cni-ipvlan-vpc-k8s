@@ -42,13 +42,14 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-// constants for full jitter backoff in milliseconds, and for nodeport marks
+// constants for full jitter backoff in milliseconds, and for nodeport
 const (
 	maxSleep             = 10000 // 10.00s
 	baseSleep            = 20    //  0.02
 	RPFilterTemplate     = "net.ipv4.conf.%s.rp_filter"
 	podRulePriority      = 1024
 	nodePortRulePriority = 512
+	nodePortPodTable     = 100
 )
 
 func init() {
@@ -240,7 +241,7 @@ func addPolicyRules(veth *net.Interface, ipc *current.IPConfig, routes []*types.
 	return nil
 }
 
-func setupNodePortRule(ifName string, nodePorts string, nodePortMark int) error {
+func setupNodePortRuleHost(ifName string, nodePorts string, nodePortMark int) error {
 	ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
 	if err != nil {
 		return fmt.Errorf("failed to locate iptables: %v", err)
@@ -288,6 +289,80 @@ func setupNodePortRule(ifName string, nodePorts string, nodePortMark int) error 
 		}
 	}
 
+	return nil
+}
+
+func setupNodePortRuleCont(netns ns.NetNS, ifName string, hostAddr netlink.Addr, nodePorts string, nodePortMark int) error {
+	ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	if err != nil {
+		return fmt.Errorf("failed to locate iptables: %v", err)
+	}
+
+	err = netns.Do(func(hostNS ns.NetNS) error {
+		// Create iptables rules to ensure that nodeport traffic is marked
+		if err := ipt.AppendUnique("mangle", "PREROUTING", "-i", ifName, "!", "-s", hostAddr.IP.String(), "-j", "CONNMARK", "--set-mark", strconv.Itoa(nodePortMark), "-m", "comment", "--comment", "NodePort Mark"); err != nil {
+			return err
+		}
+
+		if err := ipt.AppendUnique("mangle", "OUTPUT", "-j", "CONNMARK", "--restore-mark", "-m", "comment", "--comment", "NodePort Mark"); err != nil {
+			return err
+		}
+
+		contVeth, err := net.InterfaceByName(ifName)
+                if err != nil {
+                        return fmt.Errorf("failed to look up %q: %v", ifName, err)
+                }
+
+		// Disable RP filter in pod Netns (for some reason loose does not work here)
+		_, err = sysctl.Sysctl(fmt.Sprintf(RPFilterTemplate, ifName), "0")
+		if err != nil {
+			return fmt.Errorf("failed to disable for interface %q: %v", ifName, err)
+		}
+		_, err = sysctl.Sysctl(fmt.Sprintf(RPFilterTemplate, "all"), "0")
+		if err != nil {
+			return fmt.Errorf("failed to disable RP filter for all: %v", err)
+		}
+
+		err = netlink.RouteAdd(&netlink.Route{
+			LinkIndex: contVeth.Index,
+			Scope:     netlink.SCOPE_UNIVERSE,
+			Dst:       nil,
+			Gw:        hostAddr.IP,
+			Table:	   nodePortPodTable,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to add default route %v: %v", hostAddr.IP, err)
+		}
+
+		err = netlink.RouteAdd(&netlink.Route{
+			LinkIndex: contVeth.Index,
+			Scope:     netlink.SCOPE_LINK,
+			Dst: &net.IPNet{
+				IP:   hostAddr.IP,
+				Mask: net.CIDRMask(32, 32),
+			},
+			Table:     nodePortPodTable,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to add scope link route %v: %v", hostAddr.IP, err)
+		}
+
+		// add policy route for traffic from marked as nodeport
+		rule := netlink.NewRule()
+		rule.Mark = nodePortMark
+		rule.Table = nodePortPodTable
+		rule.Priority = nodePortRulePriority
+
+		err = netlink.RuleAdd(rule)
+		if err != nil {
+			return fmt.Errorf("failed to add policy rule %v: %v", rule, err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("Unable to configure nodeport in pod: %v", err)
+	}
 	return nil
 }
 
@@ -518,7 +593,11 @@ func cmdAdd(args *skel.CmdArgs) error {
 		}
 	}
 
-	if err = setupNodePortRule(conf.HostInterface, conf.NodePorts, conf.NodePortMark); err != nil {
+	if err = setupNodePortRuleHost(conf.HostInterface, conf.NodePorts, conf.NodePortMark); err != nil {
+		return err
+	}
+
+	if err = setupNodePortRuleCont(netns, conf.ContainerInterface, hostAddrs[0], conf.NodePorts, conf.NodePortMark); err != nil {
 		return err
 	}
 
