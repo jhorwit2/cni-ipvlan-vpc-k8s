@@ -18,6 +18,8 @@
 package main
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -309,9 +311,9 @@ func setupNodePortRuleCont(netns ns.NetNS, ifName string, hostAddr netlink.Addr,
 		}
 
 		contVeth, err := net.InterfaceByName(ifName)
-                if err != nil {
-                        return fmt.Errorf("failed to look up %q: %v", ifName, err)
-                }
+		if err != nil {
+			return fmt.Errorf("failed to look up %q: %v", ifName, err)
+		}
 
 		// Disable RP filter in pod Netns (for some reason loose does not work here)
 		_, err = sysctl.Sysctl(fmt.Sprintf(RPFilterTemplate, ifName), "0")
@@ -328,7 +330,7 @@ func setupNodePortRuleCont(netns ns.NetNS, ifName string, hostAddr netlink.Addr,
 			Scope:     netlink.SCOPE_UNIVERSE,
 			Dst:       nil,
 			Gw:        hostAddr.IP,
-			Table:	   nodePortPodTable,
+			Table:     nodePortPodTable,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to add default route %v: %v", hostAddr.IP, err)
@@ -341,7 +343,7 @@ func setupNodePortRuleCont(netns ns.NetNS, ifName string, hostAddr netlink.Addr,
 				IP:   hostAddr.IP,
 				Mask: net.CIDRMask(32, 32),
 			},
-			Table:     nodePortPodTable,
+			Table: nodePortPodTable,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to add scope link route %v: %v", hostAddr.IP, err)
@@ -366,7 +368,7 @@ func setupNodePortRuleCont(netns ns.NetNS, ifName string, hostAddr netlink.Addr,
 	return nil
 }
 
-func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, hostAddrs []netlink.Addr, masq, containerIPV4, containerIPV6 bool, k8sIfName string, pr *current.Result) (*current.Interface, *current.Interface, error) {
+func setupContainerVeth(netns ns.NetNS, hostVethName string, ifName string, mtu int, hostAddrs []netlink.Addr, masq, containerIPV4, containerIPV6 bool, k8sIfName string, pr *current.Result) (*current.Interface, *current.Interface, error) {
 	hostInterface := &current.Interface{}
 	containerInterface := &current.Interface{}
 
@@ -375,7 +377,38 @@ func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, hostAddrs []netl
 		if err != nil {
 			return err
 		}
-		hostInterface.Name = hostVeth.Name
+
+		// SetupVeth pics a random name for the host veth, which isn't compatible with
+		// calico, so we need to rename the interface so it can be determined by calico for
+		// policy enforcement.
+		err = hostNS.Do(func(_ ns.NetNS) error {
+			hostVeth, err := netlink.LinkByName(hostVeth.Name)
+			if err != nil {
+				return err
+			}
+
+			err = netlink.LinkSetDown(hostVeth)
+			if err != nil {
+				return err
+			}
+
+			err = netlink.LinkSetName(hostVeth, hostVethName)
+			if err != nil {
+				return err
+			}
+
+			hostVeth, err = netlink.LinkByName(hostVethName)
+			if err != nil {
+				return err
+			}
+
+			return netlink.LinkSetUp(hostVeth)
+		})
+		if err != nil {
+			return fmt.Errorf("error renaming host veth: %v", err)
+		}
+
+		hostInterface.Name = hostVethName
 		hostInterface.Mac = hostVeth.HardwareAddr.String()
 		containerInterface.Name = contVeth0.Name
 		// ip.SetupVeth does not retrieve MAC address from peer in veth
@@ -563,7 +596,9 @@ func cmdAdd(args *skel.CmdArgs) error {
 		}
 	}
 
-	hostInterface, _, err := setupContainerVeth(netns, conf.ContainerInterface, conf.MTU,
+	hostVethName := generateHostVethName("oci")
+
+	hostInterface, _, err := setupContainerVeth(netns, hostVethName, conf.ContainerInterface, conf.MTU,
 		hostAddrs, conf.IPMasq, containerIPV4, containerIPV6, args.IfName, conf.PrevResult)
 	if err != nil {
 		return err
@@ -603,6 +638,12 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 	// Pass through the result for the next plugin
 	return types.PrintResult(conf.PrevResult, conf.CNIVersion)
+}
+
+func generateHostVethName(prefix string) string {
+	h := sha1.New()
+	h.Write([]byte(fmt.Sprintf("%s.%s", os.Getenv("K8S_POD_NAMESPACE"), os.Getenv("K8S_POD_NAME"))))
+	return fmt.Sprintf("%s%s", prefix, hex.EncodeToString(h.Sum(nil))[:11])
 }
 
 // cmdDel is called for DELETE requests
